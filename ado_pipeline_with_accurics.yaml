@@ -1,0 +1,18 @@
+trigger:
+- master 
+
+pool:
+  vmImage: 'macos-latest'
+
+steps:
+- task: CmdLine@2
+  inputs:
+   script: |
+     brew install terraform
+     brew install accurics
+     #export ARM_SUBSCRIPTION_ID= 96fbde75-88c0-4302-8491-fc79a2ab76d4
+     #export ARM_TENANT_ID= 8d894c2b-238f-490b-8dd1-d93898c5bf83
+     #export ARM_CLIENT_ID= c2164389-0546-47b2-8df8-f4bdb1e2a8fd
+     export ARM_CLIENT_SECRET= $(ARM_CLIENT_SECRET)
+     accurics init
+     accurics plan
