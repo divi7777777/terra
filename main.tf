@@ -1,109 +1,76 @@
-provider "aws" {
-  region = var.region
-}
+resource "random_id" "main" {
+  count = var.node_group_name == "" ? 1 : 0
 
-data "aws_availability_zones" "available" {
-  state = "available"
-}
+  byte_length = 4
 
-#####
-# VPC and subnets
-#####
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "2.48.0"
+  keepers = {
+    ami_type       = var.ami_type
+    disk_size      = var.disk_size
+    instance_types = var.instance_types != null ? join("|", var.instance_types) : ""
+    node_role_arn  = var.node_role_arn
 
-  name = "Cloudforte-Devsecops-vpc"
+    ec2_ssh_key               = var.ec2_ssh_key
+    source_security_group_ids = join("|", var.source_security_group_ids)
 
-  cidr = "10.0.0.0/20"
-
-  azs              = data.aws_availability_zones.available.names
-  private_subnets  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  public_subnets   = ["10.0.6.0/24", "10.0.7.0/24", "10.0.8.0/24"]
-  database_subnets = ["10.0.11.0/24", "10.0.12.0/24", "10.0.13.0/24"]
-
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = "1"
-  }
-
-  database_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = "1"
-  }
-
-  public_subnet_tags = {
-    "kubernetes.io/role/elb" = "1"
-  }
-
-  enable_dns_hostnames   = true
-  enable_dns_support     = true
-  enable_nat_gateway     = true
-  enable_vpn_gateway     = true
-  single_nat_gateway     = true
-  one_nat_gateway_per_az = false
-
-  tags = {
-    "kubernetes.io/cluster/eks" = "shared",
-    Environment                 = "test"
+    subnet_ids           = join("|", var.subnet_ids)
+    cluster_name         = var.cluster_name
+    launch_template_id   = lookup(var.launch_template, "id", "")
+    launch_template_name = lookup(var.launch_template, "name", "")
   }
 }
 
-#####
-# EKS Cluster
-#####
+resource "aws_eks_node_group" "main" {
+  cluster_name    = var.cluster_name
+  node_group_name = var.node_group_name == "" ? join("-", [var.cluster_name, random_id.main[0].hex]) : var.node_group_name
+  node_role_arn   = var.node_role_arn == "" ? join("", aws_iam_role.main.*.arn) : var.node_role_arn
 
-resource "aws_eks_cluster" "cluster" {
-  enabled_cluster_log_types = []
-  name                      = var.cluster_name
-  role_arn                  = aws_iam_role.cluster.arn
-  version                   = "1.17"
+  subnet_ids = var.subnet_ids
 
-  vpc_config {
-    subnet_ids              = flatten([module.vpc.public_subnets, module.vpc.private_subnets, module.vpc.database_subnets])
-    security_group_ids      = []
-    endpoint_private_access = "true"
-    endpoint_public_access  = "true"
+  ami_type       = var.ami_type
+  disk_size      = var.disk_size
+  instance_types = var.instance_types
+  labels         = var.kubernetes_labels
+
+  release_version = var.ami_release_version
+  version         = var.kubernetes_version
+
+  force_update_version = var.force_update_version
+
+  tags = var.tags
+
+  scaling_config {
+    desired_size = var.desired_size
+    max_size     = var.max_size
+    min_size     = var.min_size
   }
-}
 
-resource "aws_iam_role" "cluster" {
-  name = join("-", ["eks-cluster-role", var.cluster_name])
-
-  assume_role_policy = <<POLICY
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "eks.amazonaws.com"
-      },
-      "Action": "sts:AssumeRole"
+  dynamic "remote_access" {
+    for_each = var.ec2_ssh_key != null && var.ec2_ssh_key != "" ? ["true"] : []
+    content {
+      ec2_ssh_key               = var.ec2_ssh_key
+      source_security_group_ids = var.source_security_group_ids
     }
-  ]
-}
-POLICY
-}
+  }
 
-resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSClusterPolicy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
-  role       = aws_iam_role.cluster.name
-}
+  dynamic "launch_template" {
+    for_each = length(var.launch_template) == 0 ? [] : [var.launch_template]
+    content {
+      id      = lookup(launch_template.value, "id", null)
+      name    = lookup(launch_template.value, "name", null)
+      version = lookup(launch_template.value, "version")
+    }
+  }
 
-resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSServicePolicy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSServicePolicy"
-  role       = aws_iam_role.cluster.name
+  lifecycle {
+    create_before_destroy = true
+    ignore_changes        = [scaling_config.0.desired_size]
+  }
 }
-
-#####
-# EKS Node Group per availability zone
-# If you are running a stateful application across multiple Availability Zones that is backed by Amazon EBS volumes and using the Kubernetes Cluster Autoscaler,
-# you should configure multiple node groups, each scoped to a single Availability Zone. In addition, you should enable the --balance-similar-node-groups feature.
-#
-# In this setup you can configure a single IAM Role that is attached to multiple node groups.
-#####
 
 resource "aws_iam_role" "main" {
-  name = join("-", ["eks-managed-group-node-role", var.cluster_name])
+  count = var.create_iam_role ? 1 : 0
+
+  name = var.node_group_role_name == "" ? "${var.cluster_name}-managed-group-node" : var.node_group_role_name
 
   assume_role_policy = <<EOF
 {
@@ -122,101 +89,22 @@ EOF
 }
 
 resource "aws_iam_role_policy_attachment" "main_AmazonEKSWorkerNodePolicy" {
+  count = var.create_iam_role ? 1 : 0
+
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-  role       = aws_iam_role.main.name
+  role       = aws_iam_role.main[0].name
 }
 
 resource "aws_iam_role_policy_attachment" "main_AmazonEKS_CNI_Policy" {
+  count = var.create_iam_role ? 1 : 0
+
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-  role       = aws_iam_role.main.name
+  role       = aws_iam_role.main[0].name
 }
 
 resource "aws_iam_role_policy_attachment" "main_AmazonEC2ContainerRegistryReadOnly" {
+  count = var.create_iam_role ? 1 : 0
+
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-  role       = aws_iam_role.main.name
-}
-
-module "eks-node-group-app" {
-  source          = "./modules/node_group"
-  node_group_name = join("-", [aws_eks_cluster.cluster.name, "app"])
-  create_iam_role = false
-  region          = var.region
-
-  cluster_name  = aws_eks_cluster.cluster.id
-  node_role_arn = aws_iam_role.main.arn
-  subnet_ids    = [module.vpc.private_subnets[0], module.vpc.private_subnets[1], module.vpc.private_subnets[2]]
-
-  desired_size = 1
-  min_size     = 1
-  max_size     = 1
-
-  instance_types = ["t3.small"]
-
-  ec2_ssh_key = var.ec2_ssh_key
-
-  kubernetes_labels = {
-    lifecycle = "OnDemand"
-    tier      = "app"
-    # az        = data.aws_availability_zones.available.names[0]
-  }
-
-  tags = {
-    Environment = "test"
-  }
-}
-
-module "eks-node-group-data" {
-  source          = "./modules/node_group"
-  node_group_name = join("-", [aws_eks_cluster.cluster.name, "data"])
-  create_iam_role = false
-  region          = var.region
-
-  cluster_name  = aws_eks_cluster.cluster.id
-  node_role_arn = aws_iam_role.main.arn
-  subnet_ids    = [module.vpc.database_subnets[0], module.vpc.database_subnets[1], module.vpc.database_subnets[2]]
-
-  desired_size = 1
-  min_size     = 1
-  max_size     = 1
-
-  instance_types = ["t2.small"]
-
-  ec2_ssh_key = var.ec2_ssh_key
-
-  kubernetes_labels = {
-    lifecycle = "OnDemand"
-    tier      = "data"
-    # az        = data.aws_availability_zones.available.names[1]
-  }
-
-  tags = {
-    Environment = "test"
-  }
-}
-
-module "eks-node-group-web" {
-  source          = "./modules/node_group"
-  node_group_name = join("-", [aws_eks_cluster.cluster.name, "web"])
-  create_iam_role = false
-  region          = var.region
-
-  cluster_name  = aws_eks_cluster.cluster.id
-  node_role_arn = aws_iam_role.main.arn
-  subnet_ids    = [module.vpc.public_subnets[0], module.vpc.public_subnets[1], module.vpc.public_subnets[2]]
-
-  desired_size = 1
-  min_size     = 1
-  max_size     = 1
-
-  ec2_ssh_key = var.ec2_ssh_key
-
-  kubernetes_labels = {
-    lifecycle = "OnDemand"
-    tier      = "web"
-    # az        = data.aws_availability_zones.available.names[2]
-  }
-
-  tags = {
-    Environment = "test"
-  }
+  role       = aws_iam_role.main[0].name
 }
